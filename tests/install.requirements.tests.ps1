@@ -96,6 +96,31 @@ function Assert-NotExists {
   }
 }
 
+function Assert-NoOperationalArtifacts {
+  param(
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$MessagePrefix
+  )
+
+  Assert-NotExists -Path (Join-Path $Root 'log') -Message ('{0} should not create log' -f $MessagePrefix)
+  Assert-NotExists -Path (Join-Path $Root 'state') -Message ('{0} should not create state' -f $MessagePrefix)
+  Assert-NotExists -Path (Join-Path $Root 'temp') -Message ('{0} should not create temp' -f $MessagePrefix)
+}
+
+function Assert-NoInstalledStateArtifacts {
+  param(
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$Bin,
+    [Parameter(Mandatory = $true)][string]$MessagePrefix
+  )
+
+  Assert-NotExists -Path (Join-Path $Root 'state\install.ps1-state.json') -Message ('{0} should not write state file' -f $MessagePrefix)
+  Assert-NotExists -Path (Join-Path $Bin 'VERSION') -Message ('{0} should not write VERSION' -f $MessagePrefix)
+
+  $cachedZip = Get-ChildItem -LiteralPath (Join-Path $Root 'temp') -File -Filter 'install.ps1-v*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+  Assert-True -Condition ($null -eq $cachedZip) -Message ('{0} should not cache an installed zip' -f $MessagePrefix)
+}
+
 function New-TestDirectory {
   param([Parameter(Mandatory = $true)][string]$Path)
   New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -137,17 +162,22 @@ function New-TestPackageZip {
     [string]$ToolBody = "Write-Output 'tool ok'",
     [switch]$InvalidSyntax,
     [switch]$MissingInstaller,
-    [switch]$MultipleTopLevelFolders
+    [switch]$MultipleTopLevelFolders,
+    [switch]$InvalidTopLevelFolderName,
+    [switch]$NoPowerShellFiles
   )
 
   Add-Type -AssemblyName System.IO.Compression
   Add-Type -AssemblyName System.IO.Compression.FileSystem
 
   $stage = Join-Path $script:WorkRoot ('pkg-{0}' -f [guid]::NewGuid().ToString('N'))
-  $top = Join-Path $stage ('{0}-{1}' -f $PackageName, $Version)
+  $folderName = if ($InvalidTopLevelFolderName) { '{0}-v{1}' -f $PackageName, $Version } else { '{0}-{1}' -f $PackageName, $Version }
+  $top = Join-Path $stage $folderName
   New-TestDirectory -Path $top | Out-Null
 
-  Write-Utf8File -Path (Join-Path $top 'tool.ps1') -Text $ToolBody
+  if (-not $NoPowerShellFiles) {
+    Write-Utf8File -Path (Join-Path $top 'tool.ps1') -Text $ToolBody
+  }
   Write-Utf8File -Path (Join-Path $top 'lib\helper.psm1') -Text "function Get-Helper { 'helper' }"
 
   if (-not $MissingInstaller) {
@@ -232,6 +262,34 @@ Invoke-TestCase -Name 'Rejects non-bin working directory without TargetPath' -Bo
   $result = Invoke-Installer -InstallerPath (Join-Path $caller.Bin 'install.ps1') -WorkingDirectory $caller.Root -Arguments @('-Source', $zipPath)
   Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should fail when run outside a bin directory without -TargetPath'
   Assert-Match -Actual $result.Output -Pattern 'folder named "bin"' -Message 'Failure should explain the bin-directory requirement'
+  Assert-NoOperationalArtifacts -Root $caller.Root -MessagePrefix 'Non-bin rejection'
+}
+
+Invoke-TestCase -Name 'Rejects -TargetPath that does not exist' -Body {
+  $caller = New-TestInstallRoot -Name 'missing-target-path-caller'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $caller.Bin 'install.ps1') -Force
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '1.0.0'
+  $missingTarget = Join-Path $script:WorkRoot 'missing-target\bin'
+
+  $result = Invoke-Installer -InstallerPath (Join-Path $caller.Bin 'install.ps1') -WorkingDirectory $caller.Bin -Arguments @('-TargetPath', $missingTarget, '-Source', $zipPath)
+  Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should reject a TargetPath that does not exist'
+  Assert-Match -Actual $result.Output -Pattern 'must point to an existing directory' -Message 'Failure should explain that TargetPath must exist'
+  Assert-NoOperationalArtifacts -Root $caller.Root -MessagePrefix 'Missing TargetPath rejection'
+}
+
+Invoke-TestCase -Name 'Rejects -TargetPath not named bin' -Body {
+  $caller = New-TestInstallRoot -Name 'invalid-target-leaf-caller'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $caller.Bin 'install.ps1') -Force
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '1.0.0'
+  $targetRoot = Join-Path $script:WorkRoot 'invalid-target-leaf'
+  $target = Join-Path $targetRoot 'tools'
+  New-TestDirectory -Path $target | Out-Null
+
+  $result = Invoke-Installer -InstallerPath (Join-Path $caller.Bin 'install.ps1') -WorkingDirectory $caller.Bin -Arguments @('-TargetPath', $target, '-Source', $zipPath)
+  Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should reject a TargetPath whose leaf is not bin'
+  Assert-Match -Actual $result.Output -Pattern 'folder named "bin"' -Message 'Failure should explain the TargetPath bin requirement'
+  Assert-NoOperationalArtifacts -Root $caller.Root -MessagePrefix 'Non-bin TargetPath rejection'
+  Assert-NoOperationalArtifacts -Root $targetRoot -MessagePrefix 'Rejected target path'
 }
 
 Invoke-TestCase -Name 'Installs into TargetPath and creates target-local operational artifacts' -Body {
@@ -308,6 +366,18 @@ Invoke-TestCase -Name 'Rejects invalid package structure' -Body {
   $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
   Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should reject a package with multiple top-level folders'
   Assert-Match -Actual $result.Output -Pattern 'exactly one top-level folder' -Message 'Failure should mention the top-level folder rule'
+  Assert-NoInstalledStateArtifacts -Root $root.Root -Bin $root.Bin -MessagePrefix 'Invalid package structure rejection'
+}
+
+Invoke-TestCase -Name 'Rejects invalid top-level package folder name' -Body {
+  $root = New-TestInstallRoot -Name 'invalid-folder-name'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '1.0.0' -InvalidTopLevelFolderName
+
+  $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should reject a package whose top-level folder does not end with a numeric version'
+  Assert-Match -Actual $result.Output -Pattern 'Top-level folder name must be <NAME>-<NUMERICAL_VERSION>' -Message 'Failure should explain the required top-level folder naming convention'
+  Assert-NoInstalledStateArtifacts -Root $root.Root -Bin $root.Bin -MessagePrefix 'Invalid folder name rejection'
 }
 
 Invoke-TestCase -Name 'Rejects package missing install.ps1' -Body {
@@ -318,6 +388,7 @@ Invoke-TestCase -Name 'Rejects package missing install.ps1' -Body {
   $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
   Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should reject a package missing install.ps1'
   Assert-Match -Actual $result.Output -Pattern 'Package must contain install\.ps1' -Message 'Failure should mention missing install.ps1'
+  Assert-NoInstalledStateArtifacts -Root $root.Root -Bin $root.Bin -MessagePrefix 'Missing install.ps1 rejection'
 }
 
 Invoke-TestCase -Name 'Rejects syntax-invalid PowerShell package content' -Body {
@@ -328,6 +399,8 @@ Invoke-TestCase -Name 'Rejects syntax-invalid PowerShell package content' -Body 
   $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
   Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should reject syntax-invalid packages'
   Assert-Match -Actual $result.Output -Pattern 'syntax errors' -Message 'Failure should mention syntax validation'
+  Assert-Match -Actual $result.Output -Pattern 'broken\.ps1\(\d+,\d+\)' -Message 'Failure should identify the syntax-invalid file and location'
+  Assert-NoInstalledStateArtifacts -Root $root.Root -Bin $root.Bin -MessagePrefix 'Syntax validation rejection'
 }
 
 if ($script:Failures.Count -gt 0) {
