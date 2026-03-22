@@ -310,15 +310,83 @@ function Normalize-InstallerState {
   # - RememberedInternetSource: remembered remote source + cached zip metadata
   # - InternetSourceQueryHistory: recent query attempts used for cooldown/rate safety
   # Compatibility expectation: normalize missing/extra fields without failing installs.
+  function Convert-StateScalarToStableString {
+    param($Value)
+
+    if ($null -eq $Value) {
+      return $null
+    }
+
+    if ($Value -is [DateTime]) {
+      return $Value.ToUniversalTime().ToString('o')
+    }
+
+    [string]$Value
+  }
+
+  function Normalize-QueryHistoryEntries {
+    param($Entries)
+
+    $normalizedHistory = @()
+    foreach ($entry in @($Entries)) {
+      if (-not $entry) { continue }
+      $normalizedHistory += [ordered]@{
+        Kind = Convert-StateScalarToStableString $entry.Kind
+        Value = Convert-StateScalarToStableString $entry.Value
+        LastAttemptUtc = Convert-StateScalarToStableString $entry.LastAttemptUtc
+      }
+    }
+
+    @($normalizedHistory)
+  }
+
+  function Normalize-RememberedInternetSource {
+    param($Source)
+
+    if (-not $Source) {
+      return $null
+    }
+
+    [ordered]@{
+      Kind = Convert-StateScalarToStableString $Source.Kind
+      Value = Convert-StateScalarToStableString $Source.Value
+      Display = Convert-StateScalarToStableString $Source.Display
+      LastCheckedUtc = Convert-StateScalarToStableString $Source.LastCheckedUtc
+      Metadata = $Source.Metadata
+      CachedZipPath = Convert-StateScalarToStableString $Source.CachedZipPath
+      CachedZipHash = Convert-StateScalarToStableString $Source.CachedZipHash
+      CachedZipHash8 = Convert-StateScalarToStableString $Source.CachedZipHash8
+      CachedPackageVersion = Convert-StateScalarToStableString $Source.CachedPackageVersion
+    }
+  }
+
+  $lastSuccessfulInstall = $null
+  $rememberedInternetSource = $null
   $history = @()
-  if ($State -and $State.PSObject.Properties.Name -contains 'InternetSourceQueryHistory' -and $State.InternetSourceQueryHistory) {
-    $history = @($State.InternetSourceQueryHistory)
+
+  if ($State -is [System.Collections.IDictionary]) {
+    if ($State.Contains('LastSuccessfulInstall')) {
+      $lastSuccessfulInstall = $State['LastSuccessfulInstall']
+    }
+    if ($State.Contains('RememberedInternetSource')) {
+      $rememberedInternetSource = Normalize-RememberedInternetSource $State['RememberedInternetSource']
+    }
+    if ($State.Contains('InternetSourceQueryHistory') -and $State['InternetSourceQueryHistory']) {
+      $history = Normalize-QueryHistoryEntries $State['InternetSourceQueryHistory']
+    }
+  }
+  else {
+    $lastSuccessfulInstall = $State.LastSuccessfulInstall
+    $rememberedInternetSource = Normalize-RememberedInternetSource $State.RememberedInternetSource
+    if ($State -and $State.PSObject.Properties.Name -contains 'InternetSourceQueryHistory' -and $State.InternetSourceQueryHistory) {
+      $history = Normalize-QueryHistoryEntries $State.InternetSourceQueryHistory
+    }
   }
 
   ([ordered]@{
       SchemaVersion = 2
-      LastSuccessfulInstall = $State.LastSuccessfulInstall
-      RememberedInternetSource = $State.RememberedInternetSource
+      LastSuccessfulInstall = $lastSuccessfulInstall
+      RememberedInternetSource = $rememberedInternetSource
       InternetSourceQueryHistory = $history
     })
 }
@@ -1310,6 +1378,7 @@ function Resolve-SourcePlan {
       return ([ordered]@{
           ZipPath = $zipPath
           IsTemporaryZip = $false
+          StateAfterResolution = $State
           SourceContext = [ordered]@{
             SourceKind = 'Zip'
             SourceValue = $zipPath
@@ -1397,6 +1466,7 @@ function Resolve-SourcePlan {
       return ([ordered]@{
           ZipPath = ([System.IO.Path]::GetFullPath([string]$prev.CachedZipPath))
           IsTemporaryZip = $false
+          StateAfterResolution = $State
           SourceContext = [ordered]@{
             SourceKind = $requestedKind
             SourceValue = $requestedValue
@@ -1438,6 +1508,7 @@ function Resolve-SourcePlan {
         return ([ordered]@{
             ZipPath = ([System.IO.Path]::GetFullPath([string]$prev.CachedZipPath))
             IsTemporaryZip = $false
+            StateAfterResolution = $State
             SourceContext = [ordered]@{
               SourceKind = 'GitHub'
               SourceValue = $requestedValue
@@ -1465,6 +1536,7 @@ function Resolve-SourcePlan {
         return ([ordered]@{
             ZipPath = ([System.IO.Path]::GetFullPath([string]$prev.CachedZipPath))
             IsTemporaryZip = $false
+            StateAfterResolution = $State
             SourceContext = [ordered]@{
               SourceKind = 'GitHub'
               SourceValue = $requestedValue
@@ -1520,6 +1592,7 @@ function Resolve-SourcePlan {
       return ([ordered]@{
           ZipPath = ([System.IO.Path]::GetFullPath([string]$prev.CachedZipPath))
           IsTemporaryZip = $false
+          StateAfterResolution = $State
           SourceContext = [ordered]@{
             SourceKind = 'GitHub'
             SourceValue = $requestedValue
@@ -1544,6 +1617,7 @@ function Resolve-SourcePlan {
     return ([ordered]@{
         ZipPath = $downloadPath
         IsTemporaryZip = $true
+        StateAfterResolution = $State
         SourceContext = [ordered]@{
           SourceKind = 'GitHub'
           SourceValue = $requestedValue
@@ -1577,6 +1651,7 @@ function Resolve-SourcePlan {
         return ([ordered]@{
             ZipPath = ([System.IO.Path]::GetFullPath([string]$prev.CachedZipPath))
             IsTemporaryZip = $false
+            StateAfterResolution = $State
             SourceContext = [ordered]@{
               SourceKind = 'Uri'
               SourceValue = $requestedValue
@@ -1604,6 +1679,7 @@ function Resolve-SourcePlan {
         return ([ordered]@{
             ZipPath = ([System.IO.Path]::GetFullPath([string]$prev.CachedZipPath))
             IsTemporaryZip = $false
+            StateAfterResolution = $State
             SourceContext = [ordered]@{
               SourceKind = 'Uri'
               SourceValue = $requestedValue
@@ -1684,6 +1760,7 @@ function Resolve-SourcePlan {
     return ([ordered]@{
         ZipPath = $downloadPath
         IsTemporaryZip = $true
+        StateAfterResolution = $State
         SourceContext = [ordered]@{
           SourceKind = 'Uri'
           SourceValue = $requestedValue
@@ -2280,7 +2357,10 @@ try {
   if ((-not $Reinstall) -and $state.LastSuccessfulInstall -and ([string]$state.LastSuccessfulInstall.InstalledZipHash -eq $zipHash)) {
     Write-Log -Message ('Zip hash {0} matches installed state; skipping deployment.' -f $zipHash8)
 
-    $latestState = Read-InstallerState -Path $script:StatePath
+    $latestState = $sourcePlan.StateAfterResolution
+    if (-not $latestState) {
+      $latestState = Read-InstallerState -Path $script:StatePath
+    }
     $newState = Build-StateAfterNoOp `
       -OldState $latestState `
       -SourceContext $sourcePlan.SourceContext `
@@ -2329,7 +2409,10 @@ try {
   Write-Log -Message 'Preparing staged installer handoff.'
 
   $powershellExe = Get-PowerShellHostPath
-  $handoffInstallerPath = $validated.InstallerPath
+  $handoffInstallerPath = $PSCommandPath
+  if ([string]::IsNullOrWhiteSpace($handoffInstallerPath) -or (-not (Test-Path -LiteralPath $handoffInstallerPath -PathType Leaf))) {
+    throw 'Could not determine the current installer path for staged handoff.'
+  }
 
   $handoffArgs = @(
     '-NoProfile',
@@ -2346,7 +2429,7 @@ try {
     $handoffArgs += '-Verbose'
   }
 
-  Write-Log -Message ('Launching staged install with installer: {0}' -f $handoffInstallerPath)
+  Write-Log -Message ('Launching staged install with current installer: {0}' -f $handoffInstallerPath)
   & $powershellExe @handoffArgs
   $handoffExitCode = $LASTEXITCODE
   if ($handoffExitCode -ne 0) {

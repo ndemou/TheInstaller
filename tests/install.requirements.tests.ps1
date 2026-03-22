@@ -209,6 +209,7 @@ function New-TestPackageZip {
     [Parameter(Mandatory = $true)][string]$Version,
     [switch]$IncludePostInstall,
     [string]$PostInstallBody,
+    [string]$InstallerBody,
     [string]$ToolBody = "Write-Output 'tool ok'",
     [switch]$InvalidSyntax,
     [switch]$MissingInstaller,
@@ -231,7 +232,12 @@ function New-TestPackageZip {
   Write-Utf8File -Path (Join-Path $top 'lib\helper.psm1') -Text "function Get-Helper { 'helper' }"
 
   if (-not $MissingInstaller) {
-    Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $top 'install.ps1') -Force
+    if ([string]::IsNullOrWhiteSpace($InstallerBody)) {
+      Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $top 'install.ps1') -Force
+    }
+    else {
+      Write-Utf8File -Path (Join-Path $top 'install.ps1') -Text $InstallerBody
+    }
   }
 
   if ($IncludePostInstall) {
@@ -416,6 +422,22 @@ Invoke-TestCase -Name 'TargetPath install works when launched from pwsh' -Body {
   Assert-Exists -Path (Join-Path $target.Bin 'VERSION') -Message 'pwsh TargetPath install should complete deployment into target bin'
 }
 
+Invoke-TestCase -Name 'Staged deployment uses current installer logic instead of packaged installer logic' -Body {
+  $root = New-TestInstallRoot -Name 'stage-host-current'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $legacyInstaller = @'
+Write-Output "legacy packaged installer ran"
+exit 99
+'@
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2' -InstallerBody $legacyInstaller -ToolBody "Write-Output 'expected'"
+
+  $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $result.ExitCode -Expected 0 -Message 'Install should succeed even if the packaged install.ps1 is not executable as TI''s internal runner'
+  Assert-Match -Actual $result.Output -Pattern 'ReqApp updated to v3\.0\.2' -Message 'Install should complete using the current installer logic'
+  Assert-Match -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'install.ps1'))) -Pattern 'legacy packaged installer ran' -Message 'The packaged install.ps1 should still be installed into bin as payload'
+  Assert-Match -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'tool.ps1'))) -Pattern 'expected' -Message 'Payload files should still be deployed normally'
+}
+
 Invoke-TestCase -Name 'Reinstall backs up replaced files and keeps extra local files' -Body {
   $root = New-TestInstallRoot -Name 'reinstall-backups'
   Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
@@ -535,6 +557,11 @@ Invoke-TestCase -Name 'Cooldown no-op reports skipped update check' -Body {
   Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Cooldown no-op run should succeed'
   Assert-Match -Actual $second.Output -Pattern 'Skipped checking for updates \(already checked recently\)' -Message 'Cooldown no-op should report that the update check was skipped'
   Assert-LineCount -Actual $second.Output -Expected 1 -Message 'Cooldown no-op should emit one line of output'
+
+  $savedState = Read-JsonObject -Path $statePath
+  Assert-Equal -Actual (@($savedState.InternetSourceQueryHistory).Count) -Expected 1 -Message 'Cooldown no-op should preserve the remembered query history entry in saved state'
+  $savedStateRaw = [System.IO.File]::ReadAllText($statePath)
+  Assert-Match -Actual $savedStateRaw -Pattern '"LastAttemptUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T[^"]+Z"' -Message 'Cooldown no-op should persist LastAttemptUtc in round-trippable UTC format'
 }
 
 Invoke-TestCase -Name 'Changed zip hash with same version triggers reinstall' -Body {
