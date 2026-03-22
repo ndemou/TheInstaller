@@ -570,6 +570,37 @@ function Invoke-TargetPathHandoff {
   }
 }
 
+function Write-StatusLine {
+  param(
+    [Parameter(Mandatory = $true)][string]$Message,
+    [ValidateSet('LightGreen','DarkGray')][string]$Color = 'DarkGray'
+  )
+
+  $esc = [char]27
+  $colorCode = if ($Color -eq 'LightGreen') { '92' } else { '90' }
+  Write-Host ('{0}[{1}m{2}{0}[0m' -f $esc, $colorCode, $Message)
+}
+
+function Get-InstallDisplayName {
+  param($State)
+
+  if ($State -and $State.LastSuccessfulInstall -and $State.LastSuccessfulInstall.PackageName) {
+    return [string]$State.LastSuccessfulInstall.PackageName
+  }
+
+  'Program'
+}
+
+function Get-InstallDisplayVersion {
+  param($State)
+
+  if ($State -and $State.LastSuccessfulInstall -and $State.LastSuccessfulInstall.PackageVersion) {
+    return [string]$State.LastSuccessfulInstall.PackageVersion
+  }
+
+  $null
+}
+
 function Invoke-PostInstallScriptIfPresent {
   param([Parameter(Mandatory = $true)][string]$BinPath)
 
@@ -1207,6 +1238,7 @@ function Resolve-SourcePlan {
   # Intent: classify source and produce a deterministic acquisition plan.
   # Side effects: may update query-attempt state before remote checks.
   # Invariant: local zip sources must not update RememberedInternetSource.
+  $script:SourceCheckDisposition = 'Checked'
   $requestedKind = $null
   $requestedValue = $null
 
@@ -1223,6 +1255,7 @@ function Resolve-SourcePlan {
 
       $resolved = Resolve-Path -LiteralPath $sourceTrim
       $zipPath = $resolved.Path
+      $script:SourceCheckDisposition = 'LocalOffline'
 
       return ([ordered]@{
           ZipPath = $zipPath
@@ -1308,6 +1341,7 @@ function Resolve-SourcePlan {
   # Cooldown applies to query attempts, not only successful queries.
   if ($cooldownActive) {
     if (Test-RememberedCachedZipUsable -RememberedInternetSource $prev) {
+      $script:SourceCheckDisposition = 'AlreadyCheckedRecently'
       Write-Log -Message ('Reusing cached zip for {0} during the one-hour cooldown.' -f $requestedValue)
 
       return ([ordered]@{
@@ -2089,7 +2123,7 @@ function Invoke-StagedDeployment {
 
   Add-TextLineUtf8NoBom -Path $script:SummaryLogPath -Line $summary
 
-  Write-Host ('Installed version {0} from {1} (zip hash {2}). Files changed: {3}.' -f $validated.PackageVersion, $sourceContext.SourceDisplay, (Get-ShortHash -Hash $zipHash), $filesCopied)
+  Write-StatusLine -Message ('{0} updated to v{1}' -f $validated.PackageName, $validated.PackageVersion) -Color LightGreen
 
   ([ordered]@{
       PackageVersion = $validated.PackageVersion
@@ -2109,6 +2143,7 @@ $zipPath = $null
 $script:DetailedLogPath = $null
 $script:SummaryLogPath = $null
 $script:RunId = $null
+$script:SourceCheckDisposition = 'Checked'
 
 try {
   $targetBin = $null
@@ -2204,7 +2239,15 @@ try {
 
     Save-InstallerState -Path $script:StatePath -State $newState
 
-    Write-Host ('Already current. Installed zip hash is {0}.' -f $zipHash8)
+    if ($script:SourceCheckDisposition -eq 'LocalOffline') {
+      Write-StatusLine -Message 'Not checking for updates (local/offline installation)' -Color DarkGray
+    }
+    elseif ($script:SourceCheckDisposition -eq 'AlreadyCheckedRecently') {
+      Write-StatusLine -Message 'Skipped checking for updates (already checked recently)' -Color DarkGray
+    }
+    else {
+      Write-StatusLine -Message ('{0} already at the latest version (v{1})' -f (Get-InstallDisplayName -State $newState), (Get-InstallDisplayVersion -State $newState)) -Color DarkGray
+    }
     return
   }
 

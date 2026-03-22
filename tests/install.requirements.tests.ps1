@@ -86,6 +86,19 @@ function Assert-NotMatch {
   }
 }
 
+function Assert-LineCount {
+  param(
+    [Parameter(Mandatory = $true)][string]$Actual,
+    [Parameter(Mandatory = $true)][int]$Expected,
+    [Parameter(Mandatory = $true)][string]$Message
+  )
+
+  $normalized = @((($Actual -split "\r?\n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }))
+  if ($normalized.Count -ne $Expected) {
+    Fail-Test -Message ('{0}. Expected lines: "{1}". Actual lines: "{2}". Actual: {3}' -f $Message, $Expected, $normalized.Count, $Actual)
+  }
+}
+
 function Assert-Exists {
   param(
     [Parameter(Mandatory = $true)][string]$Path,
@@ -232,7 +245,7 @@ function Invoke-Installer {
   param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
     [Parameter(Mandatory = $true)][string]$WorkingDirectory,
-    [Parameter(Mandatory = $true)][string[]]$Arguments
+    [string[]]$Arguments = @()
   )
 
   $output = @()
@@ -319,6 +332,8 @@ Invoke-TestCase -Name 'Installs into TargetPath and creates target-local operati
 
   $result = Invoke-Installer -InstallerPath (Join-Path $caller.Bin 'install.ps1') -WorkingDirectory $caller.Bin -Arguments @('-TargetPath', $target.Bin, '-Source', $zipPath)
   Assert-Equal -Actual $result.ExitCode -Expected 0 -Message 'TargetPath install should succeed'
+  Assert-Match -Actual $result.Output -Pattern 'ReqApp updated to v3\.0\.2' -Message 'Normal install output should be a concise updated line'
+  Assert-LineCount -Actual $result.Output -Expected 1 -Message 'Normal install should emit one line of output'
 
   Assert-Exists -Path (Join-Path $target.Root 'log') -Message 'Target log directory should exist'
   Assert-Exists -Path (Join-Path $target.Root 'state') -Message 'Target state directory should exist'
@@ -392,12 +407,50 @@ Invoke-TestCase -Name 'State is trusted over VERSION for skip decisions' -Body {
 
   $first = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
   Assert-Equal -Actual $first.ExitCode -Expected 0 -Message 'Initial install should succeed'
+  Assert-Match -Actual $first.Output -Pattern 'ReqApp updated to v3\.0\.2' -Message 'Initial install should report the updated version'
 
   Write-Utf8File -Path (Join-Path $root.Bin 'VERSION') -Text '0.0.0'
   $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
   Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Second install should succeed'
-  Assert-Match -Actual $second.Output -Pattern 'Already current' -Message 'Installer should skip based on state even if VERSION was tampered'
+  Assert-Match -Actual $second.Output -Pattern 'Not checking for updates \(local/offline installation\)' -Message 'Local/offline no-op should say that update checking was skipped'
+  Assert-LineCount -Actual $second.Output -Expected 1 -Message 'Local/offline no-op should emit one line of output'
   Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'VERSION')).Trim()) -Expected '0.0.0' -Message 'VERSION should remain untouched on a no-op, proving state drove the decision'
+}
+
+Invoke-TestCase -Name 'Cooldown no-op reports skipped update check' -Body {
+  $root = New-TestInstallRoot -Name 'cooldown-skip'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2'
+
+  $first = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $first.ExitCode -Expected 0 -Message 'Initial install should succeed'
+
+  $statePath = Join-Path $root.Root 'state\install.ps1-state.json'
+  $state = Read-JsonObject -Path $statePath
+  $state.RememberedInternetSource = [ordered]@{
+    Kind = 'GitHub'
+    Value = 'owner/repo'
+    Display = 'github:owner/repo'
+    LastCheckedUtc = [DateTime]::UtcNow.ToString('o')
+    Metadata = [ordered]@{
+      DownloadUri = 'https://example.invalid/fake.zip'
+    }
+    CachedZipPath = [string]$state.LastSuccessfulInstall.InstalledZipPath
+    CachedZipHash = [string]$state.LastSuccessfulInstall.InstalledZipHash
+    CachedZipHash8 = [string]$state.LastSuccessfulInstall.InstalledZipHash8
+    CachedPackageVersion = [string]$state.LastSuccessfulInstall.PackageVersion
+  }
+  $state.InternetSourceQueryHistory = @([ordered]@{
+      Kind = 'GitHub'
+      Value = 'owner/repo'
+      LastAttemptUtc = [DateTime]::UtcNow.ToString('o')
+    })
+  Write-Utf8File -Path $statePath -Text ($state | ConvertTo-Json -Depth 12)
+
+  $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @()
+  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Cooldown no-op run should succeed'
+  Assert-Match -Actual $second.Output -Pattern 'Skipped checking for updates \(already checked recently\)' -Message 'Cooldown no-op should report that the update check was skipped'
+  Assert-LineCount -Actual $second.Output -Expected 1 -Message 'Cooldown no-op should emit one line of output'
 }
 
 Invoke-TestCase -Name 'Changed zip hash with same version triggers reinstall' -Body {
@@ -540,7 +593,8 @@ Invoke-TestCase -Name 'Long stage path succeeds with short atomic temp names' -B
   Assert-Equal -Actual $result.ExitCode -Expected 0 -Message 'Long stage paths should succeed with short atomic temp names'
   Assert-Exists -Path (Join-Path $root.Bin 'VERSION') -Message 'Long-path install should complete and write VERSION'
   Assert-Exists -Path (Join-Path $root.Root 'state\install.ps1-state.json') -Message 'Long-path install should record successful state'
-  Assert-Match -Actual $result.Output -Pattern 'Installed version 1\.0\.0' -Message 'Long-path install should complete normal deployment'
+  Assert-Match -Actual $result.Output -Pattern 'ReqApp updated to v1\.0\.0' -Message 'Long-path install should complete normal deployment with the concise status line'
+  Assert-LineCount -Actual $result.Output -Expected 1 -Message 'Long-path install should emit one line of output'
 }
 
 if ($script:Failures.Count -gt 0) {
