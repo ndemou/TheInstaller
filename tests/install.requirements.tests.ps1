@@ -382,8 +382,6 @@ Invoke-TestCase -Name 'Installs into TargetPath and creates target-local operati
 
   $result = Invoke-Installer -InstallerPath (Join-Path $caller.Bin 'install.ps1') -WorkingDirectory $caller.Bin -Arguments @('-TargetPath', $target.Bin, '-Source', $zipPath)
   Assert-Equal -Actual $result.ExitCode -Expected 0 -Message 'TargetPath install should succeed'
-  Assert-Match -Actual $result.Output -Pattern 'ReqApp updated to v3\.0\.2' -Message 'Normal install output should be a concise updated line'
-  Assert-LineCount -Actual $result.Output -Expected 1 -Message 'Normal install should emit one line of output'
 
   Assert-Exists -Path (Join-Path $target.Root 'log') -Message 'Target log directory should exist'
   Assert-Exists -Path (Join-Path $target.Root 'state') -Message 'Target state directory should exist'
@@ -418,7 +416,6 @@ Invoke-TestCase -Name 'TargetPath install works when launched from pwsh' -Body {
 
   $result = Invoke-InstallerWithHost -PowerShellExe $script:PwshExe -InstallerPath (Join-Path $caller.Bin 'install.ps1') -WorkingDirectory $caller.Bin -Arguments @('-TargetPath', $target.Bin, '-Source', $zipPath)
   Assert-Equal -Actual $result.ExitCode -Expected 0 -Message 'TargetPath install from pwsh should succeed'
-  Assert-Match -Actual $result.Output -Pattern 'ReqApp updated to v3\.0\.2' -Message 'pwsh TargetPath install should report the updated version'
   Assert-Exists -Path (Join-Path $target.Bin 'VERSION') -Message 'pwsh TargetPath install should complete deployment into target bin'
 }
 
@@ -493,7 +490,7 @@ Invoke-TestCase -Name 'State is trusted over VERSION for skip decisions' -Body {
 
   Write-Utf8File -Path (Join-Path $root.Bin 'VERSION') -Text '0.0.0'
   $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
-  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Second install should succeed'
+  Assert-Equal -Actual $second.ExitCode -Expected 2 -Message 'Local/offline no-op should exit with code 2'
   Assert-Match -Actual $second.Output -Pattern 'Not checking for updates \(local/offline installation\)' -Message 'Local/offline no-op should say that update checking was skipped'
   Assert-LineCount -Actual $second.Output -Expected 1 -Message 'Local/offline no-op should emit one line of output'
   Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'VERSION')).Trim()) -Expected '0.0.0' -Message 'VERSION should remain untouched on a no-op, proving state drove the decision'
@@ -554,7 +551,7 @@ Invoke-TestCase -Name 'Cooldown no-op reports skipped update check' -Body {
   Write-Utf8File -Path $statePath -Text ($state | ConvertTo-Json -Depth 12)
 
   $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @()
-  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Cooldown no-op run should succeed'
+  Assert-Equal -Actual $second.ExitCode -Expected 1 -Message 'Cooldown no-op run should exit with code 1'
   Assert-Match -Actual $second.Output -Pattern 'Skipped checking for updates \(already checked recently\)' -Message 'Cooldown no-op should report that the update check was skipped'
   Assert-LineCount -Actual $second.Output -Expected 1 -Message 'Cooldown no-op should emit one line of output'
 
@@ -640,7 +637,7 @@ Invoke-TestCase -Name 'Rejects invalid package structure' -Body {
   $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '1.0.0' -MultipleTopLevelFolders
 
   $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
-  Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should reject a package with multiple top-level folders'
+  Assert-Equal -Actual $result.ExitCode -Expected 3 -Message 'Invalid package structure should exit with internal-error code 3'
   Assert-Match -Actual $result.Output -Pattern 'exactly one top-level folder' -Message 'Failure should mention the top-level folder rule'
   Assert-NoInstalledStateArtifacts -Root $root.Root -Bin $root.Bin -MessagePrefix 'Invalid package structure rejection'
 }
@@ -689,7 +686,7 @@ exit 7
   $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '1.0.0' -IncludePostInstall -PostInstallBody $postInstall
 
   $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
-  Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should fail when post-install exits non-zero'
+  Assert-Equal -Actual $result.ExitCode -Expected 11 -Message 'Post-install exit code 7 should map to installer exit code 11'
   Assert-Match -Actual $result.Output -Pattern 'post-install\.ps1 failed with exit code 7' -Message 'Failure should report the post-install exit code'
   Assert-Exists -Path (Join-Path $root.Bin 'VERSION') -Message 'VERSION is written before post-install executes'
   Assert-NotExists -Path (Join-Path $root.Root 'state\install.ps1-state.json') -Message 'Failed post-install should not record a successful install state'

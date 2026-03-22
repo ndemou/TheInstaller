@@ -63,6 +63,11 @@ param(
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$script:ExitCodeSuccess = 0
+$script:ExitCodeSkippedRecently = 1
+$script:ExitCodeLocalOfflineNoCheck = 2
+$script:ExitCodeInternalError = 3
+$script:ExitCodePostInstallOffset = 4
 
 function Ensure-Directory {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -633,9 +638,7 @@ function Invoke-TargetPathHandoff {
     Pop-Location
   }
 
-  if ($handoffExitCode -ne 0) {
-    throw ('Target-path installer handoff failed with exit code {0}.' -f $handoffExitCode)
-  }
+  $handoffExitCode
 }
 
 function Write-StatusLine {
@@ -696,7 +699,7 @@ function Invoke-PostInstallScriptIfPresent {
 
   $postInstallPath = Join-Path $BinPath 'post-install.ps1'
   if (-not (Test-Path -LiteralPath $postInstallPath -PathType Leaf)) {
-    return
+    return 0
   }
 
   $powershellExe = Get-PowerShellHostPath
@@ -723,10 +726,12 @@ function Invoke-PostInstallScriptIfPresent {
   }
 
   if ($exitCode -ne 0) {
-    throw ('post-install.ps1 failed with exit code {0}.' -f $exitCode)
+    Write-Log -Level ERROR -Message ('post-install.ps1 failed with exit code {0}.' -f $exitCode)
+    return $exitCode
   }
 
   Write-Log -Message 'Completed post-install script successfully.'
+  0
 }
 
 function Initialize-Paths {
@@ -2204,7 +2209,12 @@ function Invoke-StagedDeployment {
     $filesSkipped++
   }
 
-  Invoke-PostInstallScriptIfPresent -BinPath $BinPath
+  $postInstallExitCode = Invoke-PostInstallScriptIfPresent -BinPath $BinPath
+  if ($postInstallExitCode -ne 0) {
+    return ([ordered]@{
+        PostInstallExitCode = $postInstallExitCode
+      })
+  }
 
   $oldState = Read-InstallerState -Path $StatePath
   $newState = Build-StateAfterSuccess `
@@ -2287,7 +2297,10 @@ try {
   }
 
   if ((-not $InternalStageRun) -and (-not [string]::IsNullOrWhiteSpace($TargetPath))) {
-    Invoke-TargetPathHandoff -ResolvedTargetPath $targetBin
+    $targetPathExitCode = Invoke-TargetPathHandoff -ResolvedTargetPath $targetBin
+    if ($targetPathExitCode -ne 0) {
+      exit $targetPathExitCode
+    }
     return
   }
 
@@ -2321,11 +2334,25 @@ try {
   $state = Read-InstallerState -Path $script:StatePath
 
   if ($InternalStageRun) {
-    Invoke-StagedDeployment `
+    $deploymentResult = Invoke-StagedDeployment `
       -BinPath $targetBin `
       -StageRoot $StageRoot `
       -StatePath $script:StatePath `
-      -TempDir $script:TempDir | Out-Null
+      -TempDir $script:TempDir
+
+    $postInstallExitCode = $null
+    if ($deploymentResult -is [System.Collections.IDictionary]) {
+      if ($deploymentResult.Contains('PostInstallExitCode')) {
+        $postInstallExitCode = $deploymentResult['PostInstallExitCode']
+      }
+    }
+    elseif ($deploymentResult -and ($deploymentResult.PSObject.Properties.Name -contains 'PostInstallExitCode')) {
+      $postInstallExitCode = $deploymentResult.PostInstallExitCode
+    }
+
+    if (($null -ne $postInstallExitCode) -and ($postInstallExitCode -ne 0)) {
+      exit ($script:ExitCodePostInstallOffset + [int]$postInstallExitCode)
+    }
 
     return
   }
@@ -2371,17 +2398,20 @@ try {
 
     if ($DevMode) {
       Write-StatusLine -Message ('{0} already at the latest version (v{1})' -f (Get-InstallDisplayName -State $newState), (Get-InstallDisplayVersion -State $newState)) -Color DarkGray
+      exit $script:ExitCodeSuccess
     }
     elseif ($script:SourceCheckDisposition -eq 'LocalOffline') {
       Write-StatusLine -Message 'Not checking for updates (local/offline installation)' -Color DarkGray
+      exit $script:ExitCodeLocalOfflineNoCheck
     }
     elseif ($script:SourceCheckDisposition -eq 'AlreadyCheckedRecently') {
       Write-StatusLine -Message 'Skipped checking for updates (already checked recently)' -Color DarkGray
+      exit $script:ExitCodeSkippedRecently
     }
     else {
       Write-StatusLine -Message ('{0} already at the latest version (v{1})' -f (Get-InstallDisplayName -State $newState), (Get-InstallDisplayVersion -State $newState)) -Color DarkGray
+      exit $script:ExitCodeSuccess
     }
-    return
   }
 
   $outerStageRoot = Get-NewStagePath -TempDir $script:TempDir
@@ -2433,7 +2463,7 @@ try {
   & $powershellExe @handoffArgs
   $handoffExitCode = $LASTEXITCODE
   if ($handoffExitCode -ne 0) {
-    throw ('Staged installer failed with exit code {0}.' -f $handoffExitCode)
+    exit $handoffExitCode
   }
 
   Write-Log -Message 'Staged installer handoff completed successfully.'
@@ -2443,7 +2473,7 @@ catch {
   if ($msg) {
     Write-Log -Level ERROR -Message $msg
   }
-  throw
+  exit $script:ExitCodeInternalError
 }
 finally {
   if ($outerStageRoot -and (Test-Path -LiteralPath $outerStageRoot)) {
