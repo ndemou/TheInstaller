@@ -2,7 +2,7 @@
 
 This tool installs and updates a software using a single zip package and a single installer script, `install.ps1`. 
 
-TI, can install from a local zip file, a direct URI, a GitHub repository’s latest stable release zip asset, or, by default, from the last Internet source that was previously used. 
+TI, can install from a local zip file, a direct URI, a GitHub repository’s latest stable release zip asset or source archive, or, by default, from the last Internet source that was previously used. 
 
 To reduce unnecessary network traffic and avoid rate limits, it remembers source metadata, reuses previously downloaded packages when appropriate, and normally checks for updates at most once per hour unless forced. Before deploying anything, the tool stages the package in a temporary area and validates it. Files are then copied without deleting extra local files. 
 
@@ -143,7 +143,8 @@ Notes:
 * GitHub access is anonymous only
 * for GitHub, TI uses the latest stable release only
 * prereleases are ignored
-* the release must contain exactly one zip asset
+* if the release contains exactly one zip asset, TI uses it
+* if the release contains no zip assets, TI falls back to the release tag source archive
 * if a GitHub release contains multiple zip assets, TI fails
 
 ### `-TargetPath <path-to-existing-bin-folder>`
@@ -190,7 +191,8 @@ When `-Source` is an HTTP/HTTPS zip URI:
 When `-Source` is `owner/repo`:
 
 * TI queries the latest stable GitHub release
-* TI expects exactly one zip asset
+* TI prefers exactly one uploaded zip asset
+* if no zip asset exists, TI falls back to the latest release tag source archive
 * TI downloads that asset anonymously
 * TI stores enough metadata to avoid unnecessary re-downloads
 * TI respects the same one-hour cooldown unless `-ForceRequery` is used

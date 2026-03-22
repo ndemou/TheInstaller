@@ -30,7 +30,9 @@ Notes:
 * a local zip `-Source` value must **not** update that remembered Internet source
 * GitHub access is anonymous only
 * for GitHub, use the latest **stable** release only, not prereleases
-* for `-Source "owner/repo"`, download the latest release **zip asset**
+* for `-Source "owner/repo"`, use the latest stable release
+* if the release has exactly one zip asset: download that asset
+* if the release has no zip assets: download the release tag source archive
 * if a GitHub release has multiple zip assets: hard error
 
 ## Default / remembered Internet source behavior

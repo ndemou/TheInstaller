@@ -34,6 +34,24 @@ function Get-TestPowerShellHost {
 
 $script:PowerShellExe = Get-TestPowerShellHost
 
+function Get-OptionalPowerShellHost {
+  param([Parameter(Mandatory = $true)][string[]]$Candidates)
+
+  foreach ($candidate in $Candidates) {
+    try {
+      $command = Get-Command -Name $candidate -ErrorAction Stop
+      if ($command -and $command.Source) {
+        return $command.Source
+      }
+    }
+    catch {}
+  }
+
+  $null
+}
+
+$script:PwshExe = Get-OptionalPowerShellHost -Candidates @('pwsh.exe', 'pwsh')
+
 function Fail-Test {
   param([Parameter(Mandatory = $true)][string]$Message)
   throw $Message
@@ -266,6 +284,32 @@ function Invoke-Installer {
   }
 }
 
+function Invoke-InstallerWithHost {
+  param(
+    [Parameter(Mandatory = $true)][string]$PowerShellExe,
+    [Parameter(Mandatory = $true)][string]$InstallerPath,
+    [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+    [string[]]$Arguments = @()
+  )
+
+  $output = @()
+  $exitCode = 0
+
+  Push-Location -LiteralPath $WorkingDirectory
+  try {
+    $output = & $PowerShellExe '-NoProfile' '-ExecutionPolicy' 'Bypass' '-File' $InstallerPath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+  }
+  finally {
+    Pop-Location
+  }
+
+  [pscustomobject]@{
+    ExitCode = $exitCode
+    Output   = (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
+  }
+}
+
 function Invoke-TestCase {
   param(
     [Parameter(Mandatory = $true)][string]$Name,
@@ -354,6 +398,22 @@ Invoke-TestCase -Name 'Installs into TargetPath and creates target-local operati
   $cachedZip = Get-ChildItem -LiteralPath (Join-Path $target.Root 'temp') -File -Filter 'install.ps1-v*.zip' | Select-Object -First 1
   Assert-True -Condition ($null -ne $cachedZip) -Message 'Installed zip should be cached in temp'
   Assert-Match -Actual $cachedZip.Name -Pattern '^install\.ps1-v3\.0\.2-[0-9a-f]{8}-\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}\.zip$' -Message 'Cached zip name should match the required naming pattern'
+}
+
+Invoke-TestCase -Name 'TargetPath install works when launched from pwsh' -Body {
+  if (-not $script:PwshExe) {
+    return
+  }
+
+  $caller = New-TestInstallRoot -Name 'target-pwsh-caller'
+  $target = New-TestInstallRoot -Name 'target-pwsh-install'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $caller.Bin 'install.ps1') -Force
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2'
+
+  $result = Invoke-InstallerWithHost -PowerShellExe $script:PwshExe -InstallerPath (Join-Path $caller.Bin 'install.ps1') -WorkingDirectory $caller.Bin -Arguments @('-TargetPath', $target.Bin, '-Source', $zipPath)
+  Assert-Equal -Actual $result.ExitCode -Expected 0 -Message 'TargetPath install from pwsh should succeed'
+  Assert-Match -Actual $result.Output -Pattern 'ReqApp updated to v3\.0\.2' -Message 'pwsh TargetPath install should report the updated version'
+  Assert-Exists -Path (Join-Path $target.Bin 'VERSION') -Message 'pwsh TargetPath install should complete deployment into target bin'
 }
 
 Invoke-TestCase -Name 'Reinstall backs up replaced files and keeps extra local files' -Body {

@@ -553,7 +553,7 @@ function Invoke-TargetPathHandoff {
     Copy-FileAtomic -SourcePath $PSCommandPath -DestinationPath $targetInstallerPath
   }
 
-  $powershellExe = Join-Path $PSHOME 'powershell.exe'
+  $powershellExe = Get-PowerShellHostPath
   $handoffArgs = Get-PublicInvocationArgs -ResolvedTargetPath $ResolvedTargetPath
   $handoffExitCode = 0
   Push-Location -LiteralPath $ResolvedTargetPath
@@ -579,6 +579,28 @@ function Write-StatusLine {
   $esc = [char]27
   $colorCode = if ($Color -eq 'LightGreen') { '92' } else { '90' }
   Write-Host ('{0}[{1}m{2}{0}[0m' -f $esc, $colorCode, $Message)
+}
+
+function Get-PowerShellHostPath {
+  $pwshPath = Join-Path $PSHOME 'pwsh.exe'
+  if (Test-Path -LiteralPath $pwshPath -PathType Leaf) {
+    return $pwshPath
+  }
+
+  $windowsPowerShellPath = Join-Path $PSHOME 'powershell.exe'
+  if (Test-Path -LiteralPath $windowsPowerShellPath -PathType Leaf) {
+    return $windowsPowerShellPath
+  }
+
+  try {
+    $selfPath = (Get-Process -Id $PID -ErrorAction Stop).Path
+    if (-not [string]::IsNullOrWhiteSpace($selfPath) -and (Test-Path -LiteralPath $selfPath -PathType Leaf)) {
+      return $selfPath
+    }
+  }
+  catch {}
+
+  throw 'Could not determine a PowerShell host executable path.'
 }
 
 function Get-InstallDisplayName {
@@ -609,7 +631,7 @@ function Invoke-PostInstallScriptIfPresent {
     return
   }
 
-  $powershellExe = Join-Path $PSHOME 'powershell.exe'
+  $powershellExe = Get-PowerShellHostPath
   $args = @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
@@ -892,13 +914,41 @@ function Get-GitHubLatestZipAssetInfo {
     throw ('GitHub latest release for {0} is not a stable release.' -f $Repo)
   }
 
-  # Exactly one zip asset is required so source selection is deterministic.
+  # Prefer exactly one uploaded zip asset. If there are none, fall back to the
+  # GitHub-generated tag source archive for the latest stable release.
   $zipAssets = @($obj.assets | Where-Object { $_.name -match '(?i)\.zip$' })
-  if ($zipAssets.Count -ne 1) {
+  if ($zipAssets.Count -gt 1) {
     throw ('GitHub latest stable release for {0} must contain exactly one .zip asset; found {1}.' -f $Repo, $zipAssets.Count)
   }
 
-  $asset = $zipAssets[0]
+  $asset = $null
+  if ($zipAssets.Count -eq 1) {
+    $asset = $zipAssets[0]
+  }
+
+  $releaseTag = [string]$obj.tag_name
+  $downloadUri = $null
+  $assetId = $null
+  $assetName = $null
+  $assetSize = $null
+  $assetUpdatedUtc = $null
+  $metadataKey = $null
+
+  if ($asset) {
+    $downloadUri = [string]$asset.browser_download_url
+    $assetId = [string]$asset.id
+    $assetName = [string]$asset.name
+    $assetSize = [string]$asset.size
+    $assetUpdatedUtc = [string]$asset.updated_at
+    $metadataKey = '{0}|{1}|{2}|{3}' -f $obj.id, $asset.id, $asset.updated_at, $asset.size
+  }
+  else {
+    $repoName = ($Repo -split '/')[1]
+    $downloadUri = 'https://github.com/{0}/archive/refs/tags/{1}.zip' -f $Repo, $releaseTag
+    $assetName = '{0}-{1}-source.zip' -f $repoName, $releaseTag
+    $assetUpdatedUtc = [string]$obj.published_at
+    $metadataKey = '{0}|source-archive|{1}|{2}' -f $obj.id, $releaseTag, $obj.published_at
+  }
 
   ([ordered]@{
       Repo = $Repo
@@ -906,14 +956,14 @@ function Get-GitHubLatestZipAssetInfo {
       NotModified = $false
       ETag = $resp.Headers['ETag']
       ReleaseId = [string]$obj.id
-      ReleaseTag = [string]$obj.tag_name
+      ReleaseTag = $releaseTag
       ReleasePublishedUtc = [string]$obj.published_at
-      AssetId = [string]$asset.id
-      AssetName = [string]$asset.name
-      AssetSize = [string]$asset.size
-      AssetUpdatedUtc = [string]$asset.updated_at
-      DownloadUri = [string]$asset.browser_download_url
-      MetadataKey = '{0}|{1}|{2}|{3}' -f $obj.id, $asset.id, $asset.updated_at, $asset.size
+      AssetId = $assetId
+      AssetName = $assetName
+      AssetSize = $assetSize
+      AssetUpdatedUtc = $assetUpdatedUtc
+      DownloadUri = $downloadUri
+      MetadataKey = $metadataKey
     })
 }
 
@@ -2278,7 +2328,7 @@ try {
   Write-Log -Message ('Staged package validated. Version={0}; Package={1}; SyntaxFilesChecked={2}' -f $validated.PackageVersion, $validated.PackageName, $validated.SyntaxFilesChecked)
   Write-Log -Message 'Preparing staged installer handoff.'
 
-  $powershellExe = Join-Path $PSHOME 'powershell.exe'
+  $powershellExe = Get-PowerShellHostPath
   $handoffInstallerPath = $validated.InstallerPath
 
   $handoffArgs = @(
