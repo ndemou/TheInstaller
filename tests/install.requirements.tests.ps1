@@ -417,6 +417,30 @@ Invoke-TestCase -Name 'State is trusted over VERSION for skip decisions' -Body {
   Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'VERSION')).Trim()) -Expected '0.0.0' -Message 'VERSION should remain untouched on a no-op, proving state drove the decision'
 }
 
+Invoke-TestCase -Name 'DevMode matching hash reports already latest without reinstalling' -Body {
+  $root = New-TestInstallRoot -Name 'devmode-noop'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $postInstall = @'
+$counterPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'state\post-install-count.txt'
+$count = 0
+if (Test-Path -LiteralPath $counterPath) {
+  $count = [int]([System.IO.File]::ReadAllText($counterPath).Trim())
+}
+[System.IO.File]::WriteAllText($counterPath, [string]($count + 1))
+'@
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2' -IncludePostInstall -PostInstallBody $postInstall
+
+  $first = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-DevMode', '-Source', $zipPath)
+  Assert-Equal -Actual $first.ExitCode -Expected 0 -Message 'Initial DevMode install should succeed'
+  Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Root 'state\post-install-count.txt')).Trim()) -Expected '1' -Message 'Initial DevMode install should run post-install once'
+
+  $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-DevMode', '-Source', $zipPath)
+  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Second DevMode install should succeed'
+  Assert-Match -Actual $second.Output -Pattern 'ReqApp already at the latest version \(v3\.0\.2\)' -Message 'DevMode no-op should report that the installed version is already current'
+  Assert-LineCount -Actual $second.Output -Expected 1 -Message 'DevMode no-op should emit one line of output'
+  Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Root 'state\post-install-count.txt')).Trim()) -Expected '1' -Message 'DevMode no-op should not rerun post-install when the zip hash matches'
+}
+
 Invoke-TestCase -Name 'Cooldown no-op reports skipped update check' -Body {
   $root = New-TestInstallRoot -Name 'cooldown-skip'
   Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force

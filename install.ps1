@@ -2227,7 +2227,7 @@ try {
 
   Write-Log -Message ('Resolved source zip: {0} (hash {1})' -f $zipPath, $zipHash8)
 
-  if ((-not $Reinstall) -and (-not $DevMode) -and $state.LastSuccessfulInstall -and ([string]$state.LastSuccessfulInstall.InstalledZipHash -eq $zipHash)) {
+  if ((-not $Reinstall) -and $state.LastSuccessfulInstall -and ([string]$state.LastSuccessfulInstall.InstalledZipHash -eq $zipHash)) {
     Write-Log -Message ('Zip hash {0} matches installed state; skipping deployment.' -f $zipHash8)
 
     $latestState = Read-InstallerState -Path $script:StatePath
@@ -2239,7 +2239,10 @@ try {
 
     Save-InstallerState -Path $script:StatePath -State $newState
 
-    if ($script:SourceCheckDisposition -eq 'LocalOffline') {
+    if ($DevMode) {
+      Write-StatusLine -Message ('{0} already at the latest version (v{1})' -f (Get-InstallDisplayName -State $newState), (Get-InstallDisplayVersion -State $newState)) -Color DarkGray
+    }
+    elseif ($script:SourceCheckDisposition -eq 'LocalOffline') {
       Write-StatusLine -Message 'Not checking for updates (local/offline installation)' -Color DarkGray
     }
     elseif ($script:SourceCheckDisposition -eq 'AlreadyCheckedRecently') {
