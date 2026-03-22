@@ -149,19 +149,14 @@ function New-AtomicTempPath {
   param([Parameter(Mandatory = $true)][string]$DestinationPath)
 
   # Temp files intentionally live beside the destination so ACL inheritance matches final writes.
-  # The '~install-' prefix is relied on by stale-temp cleanup logic.
+  # The '~TI' prefix is relied on by stale-temp cleanup logic.
   $destFull = [System.IO.Path]::GetFullPath($DestinationPath)
   $destDir = Split-Path -Parent $destFull
   Ensure-Directory -Path $destDir
 
-  $leaf = [System.IO.Path]::GetFileName($destFull)
-  $safeLeaf = Get-SafeTempLeafName -Text $leaf
-  if ([string]::IsNullOrWhiteSpace($safeLeaf)) {
-    $safeLeaf = 'file'
-  }
-
   $hash8 = Get-ShortHash -Hash (Get-StringSha256Hex -Text $destFull.ToLowerInvariant())
-  Join-Path $destDir ('~install-{0}-{1}-{2}.tmp' -f $safeLeaf, $hash8, ([guid]::NewGuid().ToString('N')))
+  $guid8 = ([guid]::NewGuid().ToString('N')).Substring(0, 8)
+  Join-Path $destDir ('~TI{0}{1}.tmp' -f $hash8, $guid8)
 }
 
 function New-InstallBackupPath {
@@ -986,7 +981,7 @@ function Remove-StaleInstallerArtifacts {
   }
 
   if (Test-Path -LiteralPath $BinPath -PathType Container) {
-    $staleBinTemps = @(Get-ChildItem -LiteralPath $BinPath -Recurse -File -Filter '~install-*.tmp' -ErrorAction SilentlyContinue)
+    $staleBinTemps = @(Get-ChildItem -LiteralPath $BinPath -Recurse -File -Filter '~TI*.tmp' -ErrorAction SilentlyContinue)
     foreach ($file in $staleBinTemps) {
       if ($file.LastWriteTime -lt $cutoff) {
         try {

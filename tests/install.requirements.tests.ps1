@@ -74,6 +74,18 @@ function Assert-Match {
   }
 }
 
+function Assert-NotMatch {
+  param(
+    [Parameter(Mandatory = $true)][string]$Actual,
+    [Parameter(Mandatory = $true)][string]$Pattern,
+    [Parameter(Mandatory = $true)][string]$Message
+  )
+
+  if ($Actual -match $Pattern) {
+    Fail-Test -Message ('{0}. Pattern: {1}. Actual: {2}' -f $Message, $Pattern, $Actual)
+  }
+}
+
 function Assert-Exists {
   param(
     [Parameter(Mandatory = $true)][string]$Path,
@@ -142,6 +154,12 @@ function Write-Utf8File {
   [System.IO.File]::WriteAllText($Path, $Text, $enc)
 }
 
+function Read-JsonObject {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json
+}
+
 function New-TestInstallRoot {
   param([Parameter(Mandatory = $true)][string]$Name)
 
@@ -159,6 +177,7 @@ function New-TestPackageZip {
     [Parameter(Mandatory = $true)][string]$PackageName,
     [Parameter(Mandatory = $true)][string]$Version,
     [switch]$IncludePostInstall,
+    [string]$PostInstallBody,
     [string]$ToolBody = "Write-Output 'tool ok'",
     [switch]$InvalidSyntax,
     [switch]$MissingInstaller,
@@ -185,10 +204,10 @@ function New-TestPackageZip {
   }
 
   if ($IncludePostInstall) {
-    $postInstall = @'
+    $postInstall = if ([string]::IsNullOrWhiteSpace($PostInstallBody)) { @'
 $markerPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'state\post-install.marker.txt'
 [System.IO.File]::WriteAllText($markerPath, 'post-install ran')
-'@
+'@ } else { $PostInstallBody }
     Write-Utf8File -Path (Join-Path $top 'post-install.ps1') -Text $postInstall
   }
 
@@ -343,6 +362,29 @@ Invoke-TestCase -Name 'Reinstall backs up replaced files and keeps extra local f
   Assert-Match -Actual ([System.IO.File]::ReadAllText($backup.FullName)) -Pattern 'mutated' -Message 'Backup should contain the pre-reinstall file content'
 }
 
+Invoke-TestCase -Name 'Reinstall forces deployment even when zip hash matches' -Body {
+  $root = New-TestInstallRoot -Name 'reinstall-force'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $postInstall = @'
+$counterPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'state\post-install-count.txt'
+$count = 0
+if (Test-Path -LiteralPath $counterPath) {
+  $count = [int]([System.IO.File]::ReadAllText($counterPath).Trim())
+}
+[System.IO.File]::WriteAllText($counterPath, [string]($count + 1))
+'@
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2' -IncludePostInstall -PostInstallBody $postInstall
+
+  $first = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $first.ExitCode -Expected 0 -Message 'Initial install should succeed'
+  Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Root 'state\post-install-count.txt')).Trim()) -Expected '1' -Message 'Initial install should run post-install once'
+
+  $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Reinstall', '-Source', $zipPath)
+  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Forced reinstall should succeed'
+  Assert-NotMatch -Actual $second.Output -Pattern 'Already current' -Message 'Forced reinstall should not no-op on matching zip hash'
+  Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Root 'state\post-install-count.txt')).Trim()) -Expected '2' -Message 'Forced reinstall should rerun post-install even when the zip hash matches'
+}
+
 Invoke-TestCase -Name 'State is trusted over VERSION for skip decisions' -Body {
   $root = New-TestInstallRoot -Name 'state-over-version'
   Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
@@ -356,6 +398,76 @@ Invoke-TestCase -Name 'State is trusted over VERSION for skip decisions' -Body {
   Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Second install should succeed'
   Assert-Match -Actual $second.Output -Pattern 'Already current' -Message 'Installer should skip based on state even if VERSION was tampered'
   Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'VERSION')).Trim()) -Expected '0.0.0' -Message 'VERSION should remain untouched on a no-op, proving state drove the decision'
+}
+
+Invoke-TestCase -Name 'Changed zip hash with same version triggers reinstall' -Body {
+  $root = New-TestInstallRoot -Name 'same-hash-new'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $zipV1 = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2' -ToolBody "Write-Output 'first'"
+  $zipV2 = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2' -ToolBody "Write-Output 'second'"
+
+  $first = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipV1)
+  Assert-Equal -Actual $first.ExitCode -Expected 0 -Message 'Initial install should succeed'
+  Assert-Match -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'tool.ps1'))) -Pattern 'first' -Message 'First package payload should be installed'
+
+  $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipV2)
+  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Install with changed zip hash should succeed'
+  Assert-NotMatch -Actual $second.Output -Pattern 'Already current' -Message 'Different zip hash should not be treated as already current'
+  Assert-Match -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Bin 'tool.ps1'))) -Pattern 'second' -Message 'Second package payload should replace the earlier payload'
+}
+
+Invoke-TestCase -Name 'Missing state file causes reinstall and state recreation' -Body {
+  $root = New-TestInstallRoot -Name 'missing-state-file'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $postInstall = @'
+$counterPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'state\post-install-count.txt'
+$count = 0
+if (Test-Path -LiteralPath $counterPath) {
+  $count = [int]([System.IO.File]::ReadAllText($counterPath).Trim())
+}
+[System.IO.File]::WriteAllText($counterPath, [string]($count + 1))
+'@
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2' -IncludePostInstall -PostInstallBody $postInstall
+
+  $first = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $first.ExitCode -Expected 0 -Message 'Initial install should succeed'
+
+  Remove-Item -LiteralPath (Join-Path $root.Root 'state\install.ps1-state.json') -Force
+
+  $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Install should succeed when the state file is missing'
+  Assert-NotMatch -Actual $second.Output -Pattern 'Already current' -Message 'Missing state should prevent a no-op skip'
+  Assert-Exists -Path (Join-Path $root.Root 'state\install.ps1-state.json') -Message 'State file should be recreated after reinstall'
+  Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Root 'state\post-install-count.txt')).Trim()) -Expected '2' -Message 'Missing state should cause deployment to run again'
+}
+
+Invoke-TestCase -Name 'Unreadable state file is ignored and rewritten' -Body {
+  $root = New-TestInstallRoot -Name 'corrupt-state-file'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $postInstall = @'
+$counterPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'state\post-install-count.txt'
+$count = 0
+if (Test-Path -LiteralPath $counterPath) {
+  $count = [int]([System.IO.File]::ReadAllText($counterPath).Trim())
+}
+[System.IO.File]::WriteAllText($counterPath, [string]($count + 1))
+'@
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '3.0.2' -IncludePostInstall -PostInstallBody $postInstall
+
+  $first = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $first.ExitCode -Expected 0 -Message 'Initial install should succeed'
+
+  Write-Utf8File -Path (Join-Path $root.Root 'state\install.ps1-state.json') -Text '{"broken": '
+
+  $second = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $second.ExitCode -Expected 0 -Message 'Install should succeed when the state file is unreadable'
+  Assert-Match -Actual $second.Output -Pattern 'State file is unreadable; ignoring it' -Message 'Unreadable state should produce a warning'
+  Assert-NotMatch -Actual $second.Output -Pattern 'Already current' -Message 'Unreadable state should prevent a no-op skip'
+  Assert-Equal -Actual ([System.IO.File]::ReadAllText((Join-Path $root.Root 'state\post-install-count.txt')).Trim()) -Expected '2' -Message 'Unreadable state should cause deployment to run again'
+
+  $state = Read-JsonObject -Path (Join-Path $root.Root 'state\install.ps1-state.json')
+  Assert-Equal -Actual ([string]$state.SchemaVersion) -Expected '2' -Message 'Unreadable state should be rewritten with the normalized schema version'
+  Assert-True -Condition ($null -ne $state.LastSuccessfulInstall) -Message 'Rewritten state should restore the last successful install snapshot'
 }
 
 Invoke-TestCase -Name 'Rejects invalid package structure' -Body {
@@ -401,6 +513,34 @@ Invoke-TestCase -Name 'Rejects syntax-invalid PowerShell package content' -Body 
   Assert-Match -Actual $result.Output -Pattern 'syntax errors' -Message 'Failure should mention syntax validation'
   Assert-Match -Actual $result.Output -Pattern 'broken\.ps1\(\d+,\d+\)' -Message 'Failure should identify the syntax-invalid file and location'
   Assert-NoInstalledStateArtifacts -Root $root.Root -Bin $root.Bin -MessagePrefix 'Syntax validation rejection'
+}
+
+Invoke-TestCase -Name 'Failing post-install stops success state from being recorded' -Body {
+  $root = New-TestInstallRoot -Name 'postfail'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $postInstall = @'
+Write-Error 'post install broke'
+exit 7
+'@
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '1.0.0' -IncludePostInstall -PostInstallBody $postInstall
+
+  $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-True -Condition ($result.ExitCode -ne 0) -Message 'Installer should fail when post-install exits non-zero'
+  Assert-Match -Actual $result.Output -Pattern 'post-install\.ps1 failed with exit code 7' -Message 'Failure should report the post-install exit code'
+  Assert-Exists -Path (Join-Path $root.Bin 'VERSION') -Message 'VERSION is written before post-install executes'
+  Assert-NotExists -Path (Join-Path $root.Root 'state\install.ps1-state.json') -Message 'Failed post-install should not record a successful install state'
+}
+
+Invoke-TestCase -Name 'Long stage path succeeds with short atomic temp names' -Body {
+  $root = New-TestInstallRoot -Name 'long-stage-path-regression-case-aaaaaaaaaaaa'
+  Copy-Item -LiteralPath $script:InstallerPath -Destination (Join-Path $root.Bin 'install.ps1') -Force
+  $zipPath = New-TestPackageZip -PackageName 'ReqApp' -Version '1.0.0'
+
+  $result = Invoke-Installer -InstallerPath (Join-Path $root.Bin 'install.ps1') -WorkingDirectory $root.Bin -Arguments @('-Source', $zipPath)
+  Assert-Equal -Actual $result.ExitCode -Expected 0 -Message 'Long stage paths should succeed with short atomic temp names'
+  Assert-Exists -Path (Join-Path $root.Bin 'VERSION') -Message 'Long-path install should complete and write VERSION'
+  Assert-Exists -Path (Join-Path $root.Root 'state\install.ps1-state.json') -Message 'Long-path install should record successful state'
+  Assert-Match -Actual $result.Output -Pattern 'Installed version 1\.0\.0' -Message 'Long-path install should complete normal deployment'
 }
 
 if ($script:Failures.Count -gt 0) {
